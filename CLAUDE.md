@@ -94,3 +94,1078 @@ Each pass may unlock additional derived values for the next one.
 
 By the final pass, all cascading and inter-dependent calculations are considered stabilized, and
 code is allowed to rely on values that were produced in earlier passes.
+
+---
+
+## Project Architecture (Python Automation Reference)
+
+This section documents the full architecture for porting game logic to Python.
+
+---
+
+## How the Code Reads JSON & Fetches Bonuses
+
+### 1. The Two JSON Sources
+
+The entire system draws from exactly **two sources of JSON data**:
+
+| Source | What it is | How accessed |
+|--------|-----------|--------------|
+| **`IdleonData`** (Firebase cloud save) | Raw per-account save state, changes constantly | `idleonData.SomeField` — most fields are JSON strings that need `tryToParse()` |
+| **`website-data.json`** | Static game definitions (formulas, names, costs, effects) | Imported at top of each parser file via `import { bubbles, stamps, ... } from '@website-data'` |
+
+These two never merge automatically — every parser manually joins them: it reads the level/progress from `IdleonData`, looks up the formula from `website-data.json`, then calls `growth()`.
+
+---
+
+### 2. `tryToParse` — The Universal Firebase Decoder
+
+**File:** `utility/helpers.js:231`
+
+```js
+export const tryToParse = (str) => {
+  try { return JSON.parse(str); }
+  catch (err) { return str; }  // if already an object/number, return as-is
+};
+```
+
+**Python equivalent:**
+```python
+import json
+def try_to_parse(val):
+    if isinstance(val, str):
+        try: return json.loads(val)
+        except: return val
+    return val
+```
+
+**Almost every `idleonData.*` field is a JSON-encoded string.** Call this before using the value. Fields that are NOT strings (like `GemsOwned`, `Atoms`, `BGunlocked`) are already numbers/arrays and pass through unchanged.
+
+Examples from parsers:
+- `tryToParse(idleonData?.CauldronP2W)` → parsed P2W array
+- `tryToParse(idleonData?.StampLv)` → parsed stamp levels array
+- `tryToParse(idleonData?.Lab)` → parsed lab data array
+- `tryToParse(idleonData?.CauldronBubbles)` → which bubbles each character has equipped
+
+---
+
+### 3. `createArrayOfArrays` — Firebase Sparse Array Converter
+
+**File:** `utility/helpers.js:261`
+
+Firebase stores arrays as sparse objects: `{ "0": v0, "1": v1, ..., "length": N }`.  
+`createArrayOfArrays` converts an outer array of these into a proper JS array-of-arrays.
+
+```js
+// Input from Firebase:
+idleonData.CauldronInfo = [ {"0": 5, "1": 3, "length": 2}, {"0": 10, "length": 1}, ... ]
+// After createArrayOfArrays:
+[ [5, 3], [10], ... ]
+```
+
+**Python equivalent:**
+```python
+def sparse_to_list(obj):
+    if isinstance(obj, dict) and 'length' in obj:
+        return [obj.get(str(i)) for i in range(int(obj['length']))]
+    return obj
+
+def create_array_of_arrays(arr):
+    return [sparse_to_list(x) for x in arr]
+```
+
+Used in: `getAlchemy` for `CauldronInfo`, `getStorage` for chest data, many others.
+
+---
+
+### 4. `createIndexedArray` — Sparse Object to Indexed List
+
+**File:** `utility/helpers.js:270`
+
+For when a Firebase sparse object needs to become a dense array, filling gaps with `{}`:
+```js
+{ "0": 5, "2": 10, "length": 3 } → [5, {}, 10]
+```
+
+Used heavily when reading per-character data like inventory bags.
+
+---
+
+### 5. `growth()` — The Core Game Formula Engine
+
+**File:** `utility/helpers.js:287`
+
+**This is the single most important function in the whole codebase.** Every bonus value — stamp level, bubble bonus, vial effect, cauldron stat, talent bonus, etc. — is computed through `growth()`.
+
+```js
+growth(func, level, x1, x2, shouldRound = true)
+```
+
+| `func` | Formula | Use case |
+|--------|---------|----------|
+| `'add'` | `((x1+x2)/x2 + 0.5*(level-1)) / (x1/x2)) * level * x1` | Most stamps, bubbles, generic additive bonuses |
+| `'decay'` | `(x1 * level) / (level + x2)` | Bonuses that approach a cap (efficiency, etc.) |
+| `'decayMulti'` | `1 + (x1 * level) / (level + x2)` | Multiplicative decay-cap bonuses |
+| `'bigBase'` | `x1 + x2 * level` | Simple linear bonuses |
+| `'addDECAY'` | Linear up to 50000, then softcapped | Very high level stamps |
+| `'reduce'` | `x1 - x2 * level` | Cost reduction bonuses |
+| `'intervalAdd'` | `x1 + floor(level / x2)` | Step-function bonuses |
+| `'special1'` | `100 - (level * x1) / (level + x2)` | Percentage-based reductions |
+
+The `x1`, `x2`, and `func` values come from `website-data.json` entries. The `level` comes from `IdleonData`.
+
+**Python equivalent:**
+```python
+import math
+
+def growth(func, level, x1, x2, should_round=True):
+    result = 0
+    if func == 'add':
+        if x2 != 0:
+            result = (((x1 + x2) / x2 + 0.5 * (level - 1)) / (x1 / x2)) * level * x1
+        else:
+            result = x1 * level
+    elif func == 'decay':
+        result = (x1 * level) / (level + x2)
+    elif func == 'decayMulti':
+        result = 1 + (x1 * level) / (level + x2)
+    elif func == 'bigBase':
+        result = x1 + x2 * level
+    elif func == 'addDECAY':
+        if level < 50001:
+            result = x1 * level
+        else:
+            result = x1 * min(50000, level) + ((level - 50000) / (level - 50000 + 150000)) * x1 * 50000
+    elif func == 'reduce':
+        result = x1 - x2 * level
+    elif func == 'bigBaseLower':
+        result = x2
+    elif func == 'intervalAdd':
+        result = x1 + math.floor(level / x2)
+    elif func == 'special1':
+        result = 100 - (level * x1) / (level + x2)
+    return round(result * 100) / 100 if should_round else result
+```
+
+---
+
+### 6. Math Helpers Used in Formulas
+
+**File:** `utility/helpers.js`
+
+| Function | Formula | Purpose |
+|----------|---------|---------|
+| `lavaLog(n)` | `log(max(n,1)) / 2.30259` | Base-10 log approximation used in some bonus formulas |
+| `lavaLog2(n)` | `log(max(n,1)) / log(2)` | Base-2 log |
+| `round(n)` | `Math.round((n + ε) * 100) / 100` | 2-decimal rounding used throughout |
+| `getCoinsArray(n)` | Splits gold number into `[plat, gold, silver, copper]` pairs | Currency display |
+
+---
+
+### 7. `website-data.json` — All 142 Keys Explained
+
+The file has 142 top-level keys. Here is the complete reference:
+
+#### Game Systems — Bonus Definitions
+| Key | Shape | What it stores |
+|-----|-------|---------------|
+| `stamps` | `{combat: [...], skills: [...], misc: [...]}` | Each stamp: `{name, func, x1, x2, effect, baseCoinCost, baseMatCost, ...}` |
+| `cauldrons` | `{power: [...], quicc: [...], high-iq: [...], kazam: [...]}` | Each bubble per cauldron: `{name, bubbleName, func, x1, x2, desc, ...}` |
+| `vials` | `{0: [...], 1: [...], ...}` | Vial definitions indexed by cauldron (0-5): `{name, func, x1, x2, desc, stat}` |
+| `sigils` | `list[24]` | Sigil definitions: `{name, unlockCost, boostCost, jadeCost, desc, x1, x2, func}` |
+| `p2w` | `list[4]` | Pay-to-win cauldron formula triplets `[x1, x2, func]` per upgrade type |
+| `prayers` | `list[25]` | Prayer defs: `{name, effect, curse, x1, x2, func, cursex1, cursex2, cursefunc}` |
+| `statues` | `list[32]` | Statue defs: `{index, name, effect, dk, bonus}` |
+| `shrines` | `dict` | Shrine defs keyed by ID: `{name, func, x1, x2, desc}` |
+| `talents` | `dict` | Talent pages by class name, each is array of `{name, func, x1, x2, bonus, description}` |
+| `arcadeShop` | `list[68]` | Arcade upgrades: `{effect, x1, x2, func, bonusName}` |
+| `labBonuses` | `list[18]` | Lab bonus nodes: `{index, x, y, range, bonusOn, bonusOff, name, func, x1, x2}` |
+| `chips` | `list[22]` | Lab chips: `{index, name, bonus, bool1, bool2}` |
+| `jewels` | `list[24]` | Lab jewels: `{index, name, bonus, x, y, radius}` |
+| `guildBonuses` | `list[18]` | Guild bonuses: `{name, bonus, gpBaseCost, gpIncrease}` |
+| `gods` | `list[10]` | Divinity gods: `{name, majorBonus, minorBonus, x1, x2}` |
+| `artifacts` | `list[41]` | Sailing artifacts: `{name, x1, baseFindChance, description}` |
+| `atoms` | → `atomsInfo` | see below |
+| `atomsInfo` | `list[15]` | Atom collider atoms: `{name, desc, x1, x2, func}` |
+| `saltLicks` | `list[10]` | Salt lick bonuses: `{name, rawName, desc}` |
+| `dungeonStats` | `list[8]` | Dungeon passive stats: `{effect, x1, x2, func, bonusName, type}` |
+| `dungeonFlurboStats` | `list[8]` | Dungeon flurbo upgrades: `{effect, x1, x2, func, bonusName}` |
+| `dungeonCreditShop` | `list[48]` | Dungeon credit shop items: `{name, bonus, increment, rarity}` |
+| `arenaBonuses` | `list[16]` | Breeding arena bonuses: `{bonus, wave}` |
+| `petUpgrades` | `list[13]` | Breeding upgrades: `{name, filler, material, ...}` |
+| `petGenes` | `list[36]` | Pet gene abilities: `{name, abilityType, combatAbility}` |
+| `petStats` | `list[4]` | Pet territorial battle stats |
+| `territory` | `list[29]` | Sailing/breeding territory definitions: `{territoryName, background, powerReq}` |
+| `equinoxUpgrades` | `list[14]` | Equinox upgrade defs: `{name, description}` |
+| `equinoxChallenges` | `list[36]` | Equinox challenge goals: `{label, goal, reward}` |
+| `riftInfo` | `list[70]` | Rift task definitions: `{monsterName, task}` |
+| `postOffice` | `list[24]` | Post office box defs: `{name, upgradeLevels, upgrades}` |
+| `superbitsUpgrades` | `list[72]` | Gaming superbits: `{description}` |
+| `gamingImports` | `list[10]` | Gaming import boxes: `{boxName, boxDescription}` |
+| `gamingUpgrades` | `list[3]` | Gaming special upgrades |
+| `gamingPalette` | `list[37]` | Gaming palette colors and bonuses |
+| `obols` | `{character: {...}, family: {...}}` | Obol shape/stat definitions |
+| `cardBonuses` | `dict` | Card bonus tables by set size (1-6 stars) |
+| `cardSets` | `dict` | Card set bonus definitions |
+| `cards` | `dict` | Individual card definitions keyed by monster raw name |
+| `constellations` | `list[49]` | Star sign constellations: `{rawIndex, mapIndex, requiredPlayers, points, name}` |
+| `starSigns` | `list[94]` | Star sign bonuses: `{starName, cost, bonuses: [{bonus, effect}]}` |
+| `companions` | `list[161]` | Companion definitions: `{name, rawName, effect}` |
+| `companionGroups` | `list[5]` | Companion group names and indices |
+| `merits` | `list[6]` | Merit board defs: `{descLine1, descLine2}` |
+| `tasks` | `list[6]` | Task board worlds: `[{name, description}]` |
+| `taskUnlocks` | `list[7]` | Task unlock rewards per world |
+| `achievements` | `list[420]` | Achievement defs: `{name, rawName, quantity, desc}` |
+| `bribes` | `list[41]` | Bribe defs: `{name, desc, value}` |
+
+#### Items & Equipment
+| Key | Shape | What it stores |
+|-----|-------|---------------|
+| `items` | `dict` | Every item keyed by rawName: `{displayName, sellPrice, typeGen, ID, Type, ...}` |
+| `itemsArray` | `list[2393]` | Same items as flat array, indexed |
+| `crafts` | `dict` | Crafting recipes keyed by item rawName: nested ingredient objects |
+| `anvilProducts` | `{0: [...], ...}` | What each anvil tab can produce, by tab index |
+| `anvilUpgradeCost` | `list[26]` | Anvil upgrade cost thresholds |
+| `invBags` | `dict` | Inventory bag definitions keyed by rawName |
+| `carryBags` | `dict` | Carry bag definitions by type (Mining, Chopping, etc.) |
+| `invStorage` | `dict` | Storage chest slot definitions |
+| `equipmentSets` | `list[19]` | Armor set definitions: `{setName, armors: [...]}` |
+
+#### World Data
+| Key | Shape | What it stores |
+|-----|-------|---------------|
+| `mapNames` | `dict` | Map index (str) → human-readable name |
+| `rawMapNames` | `list[327]` | Map raw names (used as asset paths) |
+| `mapEnemies` | `dict` | Monster rawName → array of maps it appears on |
+| `mapEnemiesArray` | `list[327]` | Per-map-index what enemies spawn (index = mapId) |
+| `mapDetails` | `list[327]` | Per-map info: `[[worldId, mapType], [w,h,overlap], [width, height, zoneLineY]]` |
+| `mapPortals` | `dict` | Map portal connections |
+| `monsters` | `dict` | Monster definitions keyed by rawName: `{monsterName, monsterMapName, afkTypes, ...}` |
+| `monsterDrops` | `dict` | Per-monster drop tables |
+| `deathNote` | `list[98]` | Death note monster list: `{rawName, name, world}` |
+
+#### World-Specific
+| Key | Shape | What it stores |
+|-----|-------|---------------|
+| `refinery` | `dict` | Refinery salt tiers (Refinery1-6): cost, cycle time, rank |
+| `towers` | `dict` | Construction tower definitions |
+| `cogKeyMap` | `dict` | Cog type mapping (a→b→c... = different cog types) |
+| `cookingMenu` | `list[74]` | Meal definitions: `{name, cookReq, rawName, baseStat}` |
+| `islands` | `list[17]` | Sailing island defs: `{name, distance, unlockReq, cloudsUnlocked}` |
+| `captainsBonuses` | `list[5]` | Captain specialty bonuses |
+| `traps` | `list[7]` | Trap type definitions: `[{trapTime, quantity, exp, trapType}]` |
+| `totems` | `list[8]` | Worship totem defs: `{monsterRawName, monsterName, minEfficiency}` |
+| `ballsBonuses` | `list[24]` | Arcade ball bonus values |
+| `weeklyBosses` | `list[9]` | Weekly boss definitions |
+| `weeklyBossesActions` | `list[22]` | Boss action options |
+| `weeklyBossesShop` | `list[2]` | Weekly boss shop items |
+| `killRoySkullShop` | `list[20]` | Killroy shop items |
+| `tomeData` | `list[118]` | Tome of knowledge entries |
+| `jadeUpgrades` | `list[50]` | Jade upgrades (sneaking): `{name, x1, x2, x3}` |
+| `ninjaUpgrades` | `list[29]` | Ninja/sneaking upgrades |
+| `pristineCharms` | `list[23]` | Pristine charm bonuses |
+| `ninjaEquipment` | `dict` | Ninja equipment slots |
+| `ninjaExtraInfo` | `list[42]` | Ninja misc data |
+| `seedInfo` | `list[7]` | Farming seed types |
+| `marketInfo` | `list[16]` | Farming market bonuses |
+| `exoticMarketInfo` | `list[80]` | Exotic market bonuses |
+| `summoningUpgrades` | `list[82]` | Summoning upgrade definitions |
+| `summoningEnemies` | `list[133]` | Summoning enemy definitions |
+| `summoningBonuses` | `list[32]` | Summoning win bonuses: `{bonusId, bonus}` |
+| `summoningEndless` | `dict` | Endless mode bonuses and difficulties |
+| `divStyles` | `list[8]` | Divinity style definitions |
+| `owlData` | `list[9]` | Owl upgrade definitions |
+| `poppyBonuses` | `list[12]` | Kangaroo (Poppy) upgrade bonuses |
+| `poppyTarBonuses` | `list[8]` | Kangaroo tar bonuses |
+| `bubbaUpgrades` | `list[28]` | Bubba clicker upgrades |
+| `holesInfo` | `list[75]` | Hole (cavern) layout data |
+| `holesBuildings` | `list[100]` | Hole building definitions |
+| `lampWishes` | `list[12]` | Hole lamp wish definitions |
+| `cosmoUpgrades` | `list[3]` | Hole cosmo upgrades |
+| `grimoire` | `list[55]` | Grimoire upgrade defs |
+| `compass` | `list[173]` | Compass upgrade defs |
+| `abominations` | `list[35]` | Compass abomination defs |
+| `tesseract` | `list[63]` | Tesseract upgrade defs |
+| `upgradeVault` | `list[90]` | Upgrade vault defs: `{name, x1, x2, x3, maxLevel}` |
+| `spelunkingUpgrades` | `list[53]` | Spelunking upgrade defs |
+| `spelunkingRocks` | `list[9]` | Rock type definitions |
+| `spelunkingChapters` | `list[7]` | Spelunking chapter bonuses |
+| `generalSpelunky` | `list[43]` | Misc spelunking data |
+| `legendTalents` | `list[50]` | Legend talent bonuses |
+| `coralReef` | `list[6]` | Coral reef upgrade defs |
+| `mineheadUpgrades` | `list[30]` | Minehead upgrade defs |
+| `tournyStuff` | `dict` | Tournament division names/scales |
+| `sushiUpgrades` | `list[45]` | Sushi station upgrades |
+| `ButtonTasks` | `list[57]` | Button clicker task definitions |
+| `ButtonBonusPerPress` | `list[9]` | Button bonus values |
+| `ButtonBonusNames` | `list[9]` | Button bonus names |
+| `research` | `list[40]` | Research grid path strings |
+| `researchGridSquares` | `list[240]` | Research grid cell defs |
+| `researchOccurrences` | `list[80]` | Research occurrence defs |
+| `researchShapes` | `list[10]` | Research shape vertex definitions |
+| `zenithMarket` | `list[10]` | Zenith market defs (statues) |
+| `emperorBonuses` | `list[48]` | Emperor bonus defs |
+
+#### Meta / Classes / Misc
+| Key | Shape | What it stores |
+|-----|-------|---------------|
+| `classes` | `list[63]` | Class names indexed by class ID (0 = '0', 1 = 'Beginner', etc.) |
+| `classFamilyBonuses` | `list[42]` | Class family bonus defs: `{name, func, x1, x2, x3, order}` |
+| `stats` | `dict` | Base stat definitions: `{BaseHP, BaseLUK, BaseMP, ...}` |
+| `bonuses` | `dict` | Misc bonus types: `{etcBonuses, cardBonuses, cardSetBonuses}` |
+| `randomList` | `list[115]` | Internal game random data arrays (used by LavaRand seeding) |
+| `randomList2` | `list[8]` | Secondary random data |
+| `slab` | `list[1886]` | All item names for the looty slab checklist |
+| `shops` | `dict` | NPC shop inventory by shop index |
+| `gemShop` | `list[4]` | Gem shop sections and purchasable items |
+| `bundles` | `dict` | Bundle definitions keyed by `bun_a` ... `bun_l` |
+| `quests` | `dict` | Quest definitions keyed by NPC name |
+| `flagsReqs` | `list[96]` | Flag unlock requirements |
+| `fishingKits` | `dict` | Fishing bait and line definitions |
+| `liquidsShop` | `list[18]` | Liquid shop items |
+
+---
+
+### 8. How a Bonus is Actually Fetched — End-to-End Example
+
+**Example: "What is my Alchemy Bubble bonus for bubble named `CROPIUS_MAPPER`?"**
+
+**Step 1:** Firebase gives `CauldronBubbles` (JSON string) → parse with `tryToParse`.
+
+**Step 2:** `getAlchemy()` calls `getBubbles(alchemyRaw)` which reads `alchemyRaw[0..3]` (the 4 cauldrons' bubble level arrays — these come from `CauldronInfo` parsed via `createArrayOfArrays`).
+
+**Step 3:** For each bubble index, it merges the level from Firebase with the static definition from `cauldrons['kazam'][index]` in `website-data.json`:
+```js
+{
+  level: parseInt(array[key]),  // from IdleonData
+  ...cauldrons['kazam'][key],   // from website-data.json: {name, bubbleName, func, x1, x2, desc}
+}
+```
+
+**Step 4:** When code later calls `getBubbleBonus(account, 'CROPIUS_MAPPER', false)`:
+```js
+const targetBubble = account.alchemy.bubblesFlat.find(b => b.bubbleName === 'CROPIUS_MAPPER');
+const value = growth(targetBubble.func, targetBubble.level, targetBubble.x1, targetBubble.x2, false);
+```
+
+The result is the current bonus value for that bubble given its current level.
+
+---
+
+### 9. Bonus Stacking Pattern — How Multiple Sources Combine
+
+Most game statistics combine bonuses from many sources. The pattern is always:
+
+```js
+// Each source calls its own getter
+const bubbleBonus = getBubbleBonus(account, 'BUBBLE_NAME', false);
+const stampBonus = getStampsBonusByEffect(account, 'Effect_Name');
+const vialBonus = getVialsBonusByEffect(account.alchemy.vials, null, 'StatName');
+const labBonus = getLabBonus(account.lab.labBonuses, 7); // index from labBonuses list
+const mealBonus = getMealsBonusByEffectOrStat(account, null, 'StatName', mealMulti);
+const arcadeBonus = getArcadeBonus(account.arcade.shop, 'Effect_Name')?.bonus;
+
+// Then combine — usually additive inside, multiplicative between categories:
+const total = baseStat * (1 + (bubbleBonus + stampBonus + vialBonus + mealBonus + arcadeBonus) / 100) * labBonus;
+```
+
+The `getXxxBonus` functions all follow the same pattern:
+1. Find the relevant entry in `account.*` (already parsed)
+2. Call `growth(func, level, x1, x2)` using the values attached during parsing
+3. Return a raw number (the bonus value, usually a percentage like `15.3`)
+
+---
+
+### 10. `getStampBonus` / `getStampsBonusByEffect` — How Stamps Work
+
+**File:** `parsers/world-1/stamps.ts:245`
+
+The stamp system joins `website-data.json` stamps data with `idleonData.StampLv`:
+
+```
+idleonData.StampLv → tryToParse → 3 arrays (combat, skills, misc)
+                                  each is sparse array of levels
+```
+
+`getStamps()` merges levels with static defs from `stamps.combat[index]`, etc.
+
+`getStampBonus(account, stampTree, stampName, character?)`:
+1. Finds the stamp in `account.stamps[stampTree]` by `rawName`
+2. Optionally applies skill-level reduction (if stamp has `skillIndex > 0`)
+3. Applies charm bonus (`Liqorice_Rolle`) if non-misc tree
+4. Applies exalted stamp multiplier if stamp is exalted
+5. Calls `growth(stamp.func, stamp.level, stamp.x1, stamp.x2, false)` × multipliers
+
+`getStampsBonusByEffect(account, effectName)`:
+- Searches ALL three stamp trees for stamps whose `effect` includes `effectName`
+- Sums `getStampBonus()` for each matching stamp
+- Used for things like: `getStampsBonusByEffect(account, 'Cap_for_all_Liquids_in_Alchemy')`
+
+---
+
+### 11. `getVialsBonusByEffect` / `getVialsBonusByStat` — How Vials Work
+
+**File:** `parsers/world-2/alchemy.ts:410`
+
+```js
+getVialsBonusByEffect(vials, effectName, statName?)
+// Filters vials by desc.includes(effectName) OR stat.includes(statName)
+// Sums: growth(func, level, x1, x2, false) * multiplier   for each matching vial
+```
+
+Vial multiplier comes from `updateVials()` which applies:
+- Lab bonus index 10 (`myFirstChemistrySet`) 
+- Rift bonus `Vial_Mastery` (2× per maxed vial)
+- Upgrade vault bonus index 42
+- Meritocracy bonus index 20
+
+---
+
+### 12. `getBubbleBonus` — How Bubbles Work
+
+**File:** `parsers/world-2/alchemy.ts:323`
+
+Three-layer multiplier system:
+1. **Base value**: `growth(func, level, x1, x2)` from the target bubble
+2. **Prisma multiplier**: if the bubble is a prisma bubble, multiply by `getPrismaMulti(account).value`
+3. **Primary multiplier** (if `shouldMultiply=true`): cauldron's bubble index 1 (the "multi" bubble for that cauldron)
+4. **Secondary multiplier** (for specific bubble indexes): cauldron's bubble index 16
+
+---
+
+### 13. `getLabBonus` — How Lab Bonuses Work
+
+**File:** `parsers/world-4/lab.ts`
+
+```js
+getLabBonus(account.lab.labBonuses, index)
+// Returns the bonus value of lab bonus node at `index`
+// The node must be "connected" (player within range) to give a bonus
+// Returns bonusOn value if connected, bonusOff otherwise
+```
+
+Lab bonus indices (from `labBonuses` in website-data.json):
+- `6` = Viaduct of Gods (liquid cauldron multiplier)
+- `7` = Certified Stamp Book (stamp multiplier)
+- `8` = Spelunker Obol (jewel/gem multiplier)
+- `10` = My 1st Chemistry Set (vial multiplier)
+
+---
+
+### 14. LavaRand — Seeded PRNG
+
+**File:** `utility/lavaRand.js`
+
+The game uses a deterministic pseudo-random number generator (not `Math.random()`). This makes certain game outcomes reproducible from the save data.
+
+Usage: `new LavaRand(seed).random(max)` returns an integer in `[0, max)`.
+
+```js
+const rng = new LavaRand(someAccountValue);
+const result = rng.random(100); // 0-99
+```
+
+The seed typically comes from account-specific values (timestamps, options, etc.) stored in `IdleonData`. Several parsers use this to determine chip/jewel rotations, random events, etc.
+
+**Python port:**
+```python
+import ctypes
+
+class LavaRand:
+    def __init__(self, seed):
+        self.seed = seed
+        self.seed2 = self._hash(seed)
+        if self.seed == 0: self.seed = 1
+        if self.seed2 == 0: self.seed2 = 1
+
+    def _mul(self, a, b):
+        return ctypes.c_int32(a * b).value
+
+    def _hash(self, e, t=5381):
+        e = self._mul(e, -862048943)
+        t ^= self._mul((e << 15) | (e >> 17 & 0x7FFF), 461845907)
+        t = (self._mul((t << 13) | (t >> 19 & 0x1FFF), 5) + -430675100) & 0xFFFFFFFF
+        t = ctypes.c_int32(t).value
+        t = self._mul(t ^ (t >> 16), -2048144789)
+        return self._mul(t ^ (t >> 13), -1028477387) ^ (t >> 16)
+
+    def random(self, e):
+        self.seed = ctypes.c_int32(36969 * (self.seed & 65535) + (self.seed >> 16)).value
+        self.seed2 = ctypes.c_int32(18000 * (self.seed2 & 65535) + (self.seed2 >> 16)).value
+        return (1073741823 & ((self.seed << 16) + self.seed2)) % e
+```
+
+---
+
+### 15. `accountOptions` — Flag Array
+
+**File:** `data/account-options-enum.js` (index → meaning)
+
+`idleonData.OptLacc` is a JSON array of numbers. After `tryToParse`, it becomes `account.accountOptions`.
+
+Access pattern: `account.accountOptions[N]` — each index is a specific game flag/counter.
+
+Examples from parsers:
+- `[89]` = Arena wave reached
+- `[99]` = Pen pals count
+- `[106]` = Dragonic liquid cauldron count (liquid index)
+- `[123]` = Another dragonic variant
+- `[383]` = Prisma fragments
+- `[384]` = Prisma bubbles string
+
+---
+
+### 16. Per-Character Field Access Pattern
+
+Per-character data in Firebase uses a `_N` suffix where N = character index (0-based):
+
+```
+idleonData["SkillLevels_0"]    // character 0's skill levels
+idleonData["SkillLevels_1"]    // character 1's skill levels
+idleonData["Anvil0_0"]         // character 0's anvil tab 0 data
+idleonData["InvBagsUsed_3"]    // character 3's inventory bags
+```
+
+`getCharacters(idleonData, charNames)` in `parsers/character.ts` iterates character count and collects all `_N` fields into per-character objects.
+
+`charNames` comes from Firebase Realtime DB at `_uid/{uid}` — it's a list of character names in order.
+
+---
+
+### Data Flow Overview
+
+```
+Firebase Realtime DB / Firestore
+        │
+        ▼
+firebase/index.js  (subscribe, auth)
+        │  raw IdleonData (JSON cloud-save blob)
+        ▼
+parsers/index.ts → parseData()
+        │  3-pass serializeData() loop
+        ▼
+{ account: Account, characters: Character[] }
+        │
+        ▼
+React Components (pages/, components/)
+```
+
+---
+
+### Raw Data: `IdleonData` (Firebase Cloud Save)
+
+**Source:** `parsers/generated-firebase-types.ts`
+
+The game saves data to Firestore under `_data/{uid}`. The raw document is called `IdleonData`.
+
+Key conventions in the raw data:
+- Most fields are **JSON-encoded strings** — must be parsed with `tryToParse()` (equivalent to `json.loads()` in Python)
+- Per-character fields use `_N` suffix: e.g. `idleonData["InvBagsUsed_0"]` = inventory bags for character 0
+- Sparse arrays from Firebase: `{ "0": val, "1": val, ..., "length": N }` — convert with `list(d[str(i)] for i in range(d["length"]))`
+
+Important top-level fields in `IdleonData`:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `OptLacc` | JSON string | Account options array (e.g. `accountOptions[478]` = a setting) |
+| `TimeAway` | JSON string | AFK time-away data per character |
+| `CauldronBubbles` | JSON string | Alchemy bubble levels |
+| `CauldronInfo` | SparseArray[] | Alchemy cauldron XP/level info |
+| `CauldronP2W` | JSON string | Pay-to-win alchemy unlocks (vials, sigils, etc.) |
+| `Breeding` | JSON string | Pet breeding data |
+| `Cooking` | JSON string | Cooking meals/kitchens |
+| `Sailing` | JSON string | Sailing boats, captains, artifacts |
+| `Divinity` | JSON string | Divinity gods and links |
+| `Gaming` | JSON string | Gaming imports/superbits |
+| `Hole` | JSON string | The Hole (World 5 caverns) |
+| `Summoning` | JSON string | Summoning game state |
+| `Farming` | JSON string | Farming crops/plots |
+| `Emperor` | JSON string | Emperor world 6 content |
+| `Atoms` | number[] | Atom collider particle counts |
+| `GemsOwned` | number | Gems currency |
+| `MoneyBANK` | string/number | Gold in bank |
+| `Cards0`/`Cards1` | JSON string | Card collections |
+| `AchieveReg` | JSON string | Achievements registry |
+| `BribeStatus` | number[] | World 1 bribes purchased |
+| `WeeklyBoss` | JSON string | Weekly boss keys/data |
+| `StampLv` | JSON string | Stamp levels |
+| `StampEvo` | JSON string | Stamp evolution data |
+| `OptionsListAccount` | JSON string | Account-wide option flags (indexed array) |
+| `InvStorage*` | JSON string | Storage chest items |
+| `ChestOrder` / `ChestQuantity` | arrays | Storage chest item IDs and quantities |
+| `Guild` | JSON string | Guild stats |
+| `Rift` | JSON string | Rift tasks/bonuses |
+| `Tome` | JSON string | Tome of knowledge |
+
+Per-character fields (append `_N` for character index N):
+- `InvBagsUsed_N` — inventory bags
+- `EquipmentOrder_N` — equipped item slots
+- `EquipmentQuantity_N` — item quantities
+- `Anvil0_N` / `Anvil1_N` — anvil production data
+- `SkillLevels_N` — skill levels array
+- `PersonalValuesMap_N` — stats: HP, MP, level, etc.
+- `TalentLevels_N` — talent levels
+- `PostOfficeInfo_N` — post office box levels
+- `PrayersSelected_N` — active prayers
+- `StarSignProg_N` — star sign progress
+- `ShrineInfo_N` — shrine data
+
+---
+
+### Entry Point: `parsers/index.ts`
+
+**`parseData(idleonData, charNames, companion, guildData, serverVars, accountCreateTime, tournament)`**
+
+The single function that converts raw `IdleonData` into the structured `Account` object.
+
+Execution:
+1. `getStaticData()` — runs parsers that only depend on raw data (no cross-dependencies). Runs once.
+2. `serializeData()` — runs all dynamic parsers 3 times (passes) to resolve cross-dependencies.
+3. Returns `{ account, characters }`.
+
+**Why 3 passes?** Some parsers depend on values computed by other parsers in the same step. For example, `lab` bonuses affect `stamps`, which affect `cooking`, etc. By re-running, later values stabilize.
+
+---
+
+### Static Parsers (computed once, no cross-deps)
+
+These are called in `getStaticData()` and can be safely ported to Python without ordering concerns:
+
+| Parser function | File | What it returns |
+|----------------|------|----------------|
+| `getCharacters()` | `parsers/character.ts` | Raw per-character data arrays |
+| `getTasks()` | `parsers/tasks.ts` | Task board data, merit descriptions, recipe unlocks |
+| `getConstellations()` | `parsers/starSigns.ts` | Star constellation progress |
+| `getCompanions()` | `parsers/misc.ts` | Companion bonuses |
+| `getBundles()` | `parsers/misc.ts` | Purchased bundle flags |
+| `getGemShop()` | `parsers/gemShop.ts` | Gem shop purchase counts |
+| `getBribes()` | `parsers/world-1/bribes.ts` | World 1 bribe status |
+| `getObols()` | `parsers/obols.ts` | Obol family bonuses |
+| `getSlab()` | `parsers/misc.ts` | Looty/slab tracked items |
+| `getPostOfficeShipments()` | `parsers/world-3/postoffice.ts` | Post office box levels |
+| `getTowers()` | `parsers/world-3/construction.ts` | Construction tower data |
+| `getAchievements()` | `parsers/achievements.ts` | Achievement status |
+| `getRift()` | `parsers/world-4/rift.ts` | Rift task completion |
+| `getShops()` | `parsers/shops.ts` | Shop stock |
+| `getTraps()` | `parsers/world-3/traps.ts` | Trapping data |
+| `getTotems()` | `parsers/world-3/worship.ts` | Worship totems |
+| `getAdviceFish()` | `parsers/misc.ts` | Advice Fish data |
+| `getGuild()` | `parsers/guild.ts` | Guild bonuses |
+
+---
+
+### Dynamic Parsers (depend on each other — order matters)
+
+These are called in `serializeData()` and must be executed in this approximate order:
+
+| Parser | File | Key dependencies |
+|--------|------|-----------------|
+| `getAlchemy()` | `world-2/alchemy.ts` | `account.accountOptions` |
+| `getArmorSmithy()` | `world-3/armorSmithy.ts` | `account` |
+| `getStorage()` | `storage.ts` | `account` |
+| `getSaltLick()` | `world-3/saltLick.ts` | `storage.list` |
+| `getDungeons()` | `dungeons.ts` | `accountOptions` |
+| `getPrayers()` | `world-3/prayers.ts` | `storage.list` |
+| `getCards()` | `cards.ts` | `account` |
+| `getCurrencies()` | `misc.ts` | `account`, `idleonData` |
+| `getStamps()` | `world-1/stamps.ts` | `account` |
+| `getBreeding()` | `world-4/breeding.ts` | `account` |
+| `getCooking()` | `world-4/cooking.ts` | `account` |
+| `getDivinity()` | `world-5/divinity.ts` | `account`, characters |
+| `getSneaking()` | `world-6/sneaking.ts` | `account`, characters |
+| `getFarming()` | `world-6/farming.ts` | `account` |
+| `getSummoning()` | `world-6/summoning.ts` | `account` |
+| `getHole()` | `world-5/hole.ts` | `account` |
+| `getLab()` | `world-4/lab.ts` | `account`, characters |
+| `getShrines()` | `world-3/shrines.ts` | `account` |
+| `getStatues()` | `world-1/statues.ts` | `account`, characters |
+| `getArcade()` | `world-2/arcade.ts` | `account` |
+| `applyStampsMulti()` | `world-1/stamps.ts` | `lab.labBonuses[7]` |
+| `updateVials()` | `world-2/alchemy.ts` | `account` |
+| `getEquinox()` | `world-3/equinox.ts` | `account` |
+| `applyMealsMulti()` | `world-4/cooking.ts` | `lab.jewels[16]` |
+| `getStarSigns()` | `starSigns.ts` | `account` |
+| `initializeCharacter()` | `character.ts` | full `account` |
+| `getGrimoire()` | `class-specific/grimoire.ts` | characters, account |
+| `getCompass()` | `class-specific/compass.ts` | characters, account |
+| `getTesseract()` | `class-specific/tesseract.ts` | characters, account |
+| `getConstruction()` | `world-3/construction.ts` | `account` |
+| `getAtoms()` | `world-3/atomCollider.ts` | `account` |
+| `getArtifacts()` / `getSailing()` | `world-5/sailing.ts` | artifacts, characters, account |
+| `getGaming()` | `world-5/gaming.ts` | characters, account |
+| `getForge()` | `world-1/forge.ts` | `account` |
+| `getRefinery()` | `world-3/refinery.ts` | `storage.list`, `tasks` |
+| `getPrinter()` | `world-3/printer.ts` | characters, account |
+| `getQuests()` | `quests.ts` | characters |
+| `getIslands()` | `world-2/islands.ts` | account, characters |
+| `getDeathNote()` | `world-3/deathNote.ts` | characters, account |
+| `getKillRoy()` | `misc.ts` | characters, account |
+| `getTome()` | `world-4/tome.ts` | account, characters |
+| `getOwl()` | `world-1/owl.ts` | account |
+| `getKangaroo()` | `world-2/kangaroo.ts` | account |
+| `getVoteBallot()` | `world-2/voteBallot.ts` | account |
+| `getUpgradeVault()` | `misc/upgradeVault.ts` | account, characters |
+| `getEmperor()` | `world-6/emperor.ts` | account |
+| `getLegendTalents()` | `world-7/legendTalents.ts` | account, characters |
+| `getGallery()` | `world-7/gallery.ts` | account |
+| `getCoralReef()` | `world-7/coralReef.ts` | account, characters |
+| `getClamWork()` | `world-7/clamWork.ts` | account |
+| `getMinehead()` | `world-7/minehead.ts` | account |
+| `getTournament()` | `world-7/tournament.ts` | account |
+| `getResearch()` | `world-7/research.ts` | account, characters |
+| `getButton()` | `world-7/button.ts` | account |
+| `getSushiStation()` | `world-7/sushiStation.ts` | account |
+| `getBubba()` | `clickers/bubba.ts` | account |
+
+---
+
+### `parsers/character.ts` — Character Initialization
+
+**`getCharacters(idleonData, charNames)`** — returns raw character arrays indexed by `_N`.
+
+**`initializeCharacter(char, charactersLevels, accountData, idleonData)`** — the heavy function that computes all per-character derived stats. Output shape is `Character` (see `generated-types.ts`). Key computed fields:
+
+- `skillsInfo` — all skill levels (mining, fishing, etc.) mapped to human-readable names
+- `talents` / `starTalents` — talent pages with levels and bonus values
+- `equipment` — parsed gear with stat bonuses
+- `cards` — equipped card bonuses
+- `anvil` — anvil production state
+- `postOffice` — post office box levels and bonuses
+- `prayers` — active prayer bonuses
+- `statues` — statue bonuses
+- `starSigns` — active star sign bonuses
+- `afkTarget` — current AFK map
+- `money` — character wallet
+- `carryCapBags` — inventory carry capacity
+- `crystalSpawnChance` — derived from talents + account bonuses
+- `constructionSpeed` / `constructionExpPerHour` — derived stats
+
+**`skillIndexMap`** (`parsers/parseMaps.ts`) maps numeric skill indices to skill names (e.g. index 0 = `Mining`).
+
+---
+
+### `parsers/misc.ts` — Account-Wide Helpers
+
+Key functions:
+
+| Function | Purpose |
+|----------|---------|
+| `getCurrencies()` | Keys, colosseum tickets, pen pals, gems, gold |
+| `getCompanions()` | Companion bonus list |
+| `getBundles()` | Which bundles purchased (`bun_a` to `bun_l` flags) |
+| `getSlab()` | Looty slab (item checklist) |
+| `calculateLeaderboard()` | Per-skill rank across all characters |
+| `calculateTotalSkillsLevel()` | Sum of all skill levels |
+| `getLibraryBookTimes()` | Library book upgrade times |
+| `getKillRoy()` | Killroy skull room data |
+| `getItemCapacity()` | Inventory carry capacity calculation |
+| `isCompanionBonusActive()` | Check if a companion bonus is active |
+| `isBundlePurchased()` | Check if a bundle was bought |
+| `getFriendBonusStats()` | Friend bonus stats aggregation |
+| `getAdviceFish()` | Advice fish bonuses |
+
+---
+
+### `parsers/world-2/alchemy.ts` — Alchemy System
+
+The alchemy system has 4 sub-systems: Bubbles, Vials, Sigils, Liquid Cauldrons.
+
+| Function | Purpose |
+|----------|---------|
+| `getAlchemy()` | Main: parses all alchemy sub-systems |
+| `getBubbleBonus(account, bubbleName, raw?)` | Get bonus value of a named bubble |
+| `getActiveBubbleBonus(account, tab, index, raw?)` | Get equipped bubble bonus |
+| `getSigilBonus(account, sigilName, raw?)` | Get sigil bonus value |
+| `getVialsBonusByEffect(account, effect, raw?)` | Get vial bonus by effect name |
+| `getVialsBonusByStat(account, stat, raw?)` | Get vial bonus by stat name |
+| `getEquippedBubbles()` | Get which bubbles are equipped per character |
+| `getLiquidCauldrons()` | Liquid cauldron speeds and caps |
+| `updateVials()` | Re-calculates vial bonuses after lab/stamps applied |
+| `applyArtifactBonusOnSigil()` | Adjusts sigil bonuses from artifacts |
+
+Raw data: `CauldronBubbles`, `CauldronInfo`, `CauldronP2W`, `CauldUpgLVs`, `CauldUpgXPs`
+
+---
+
+### `parsers/world-1/stamps.ts` — Stamps
+
+| Function | Purpose |
+|----------|---------|
+| `getStamps()` | Parses all stamp levels from `StampLv` / `StampEvo` |
+| `getStampBonus(account, stampName, raw?)` | Get a named stamp's bonus |
+| `getStampsBonusByEffect(account, effect)` | Get stamp bonus by effect category |
+| `applyStampsMulti()` | Apply lab multiplier to all stamps |
+| `updateStamps()` | Update stamp bonuses after character init |
+
+---
+
+### `parsers/world-1/statues.ts` — Statues
+
+| Function | Purpose |
+|----------|---------|
+| `getStatues()` | Parses statue levels per character + account |
+| `applyStatuesMulti()` | Applies multi-character bonuses |
+| `getStatueBonus(account, statueName)` | Get a named statue's bonus |
+
+---
+
+### `parsers/world-3/construction.ts` — Construction & Towers
+
+| Function | Purpose |
+|----------|---------|
+| `getConstruction()` | Construction buildings, cogs, cogstrution |
+| `getTowers()` | Tower levels (used as static, no account deps) |
+
+---
+
+### `parsers/world-3/refinery.ts` — Refinery
+
+Parses salt levels, redox salts, and refinery rank. Input: `storage.list` (checks if salts are in storage), `tasks` (for merit bonuses).
+
+---
+
+### `parsers/world-3/printer.ts` — 3D Printer
+
+`getPrinter(idleonData, characters, account)` — returns what each character is printing (resources) and their print amounts. Used for resource tracking.
+
+---
+
+### `parsers/world-3/shrines.ts` — Shrines
+
+`getShrines()` — parses shrine levels from `ShrineInfo_N` per character.
+`getShrineBonus(account, shrineIndex, mapIndex)` — bonus from a shrine at a map.
+`getShrineExpBonus()` — shrine EXP bonus aggregated across characters.
+
+---
+
+### `parsers/world-4/cooking.ts` — Cooking
+
+| Function | Purpose |
+|----------|---------|
+| `getCooking()` | All meal levels and bonuses |
+| `getKitchens()` | Kitchen speeds and fire bonuses |
+| `applyMealsMulti()` | Apply jewel multiplier to meals |
+
+---
+
+### `parsers/world-4/lab.ts` — Laboratory
+
+| Function | Purpose |
+|----------|---------|
+| `getLab()` | Full lab state: connected players, chips, jewels, bonuses |
+| `getLabBonus(labBonuses, index)` | Get a specific lab bonus by index |
+| `getJewelBonus(jewels, index, multi)` | Get a jewel bonus |
+| `isLabEnabledBySorcererRaw()` | Check if sorcerer lab override is active |
+
+---
+
+### `parsers/world-4/breeding.ts` — Breeding (Pets)
+
+`getBreeding()` — pet egg data, territory battles, shiny pets, arena unlocks.
+`addBreedingChance()` — applies breeding chance bonuses.
+
+---
+
+### `parsers/world-5/sailing.ts` — Sailing & Artifacts
+
+| Function | Purpose |
+|----------|---------|
+| `getSailing()` | Boats, captains, loot pile, trades |
+| `getArtifacts()` | Artifact levels and bonuses |
+
+---
+
+### `parsers/world-5/divinity.ts` — Divinity
+
+`getDivinity()` — deity links per character, god levels, divinity style bonuses.
+`applyGodCost()` — recalculates god upgrade costs based on bonuses.
+
+---
+
+### `parsers/world-6/farming.ts` — Farming
+
+`getFarming()` — crop plots, seed levels, farming bonuses.
+`updateFarming()` — second pass after characters are initialized.
+
+---
+
+### `parsers/world-6/summoning.ts` — Summoning
+
+`getSummoning()` — summoning win bonuses, essence, familiar levels.
+
+---
+
+### `parsers/world-6/sneaking.ts` — Sneaking
+
+`getSneaking()` — sneaking level progress, jade upgrades, gemstone bonuses.
+
+---
+
+### `parsers/world-7/` — World 7 Systems
+
+| File | System |
+|------|--------|
+| `spelunking.ts` | Cave spelunking bonuses |
+| `gallery.ts` | Gallery upgrades + per-character gallery bonuses |
+| `coralReef.ts` | Coral reef upgrades |
+| `clamWork.ts` | Clam work points |
+| `research.ts` | Research tree progress |
+| `minehead.ts` | Minehead upgrades |
+| `button.ts` | Button clicker (passive) |
+| `tournament.ts` | Tournament matches and leaderboard |
+| `sushiStation.ts` | Sushi station |
+| `legendTalents.ts` | Legend talent bonuses |
+
+---
+
+### `parsers/world-3/deathNote.ts` — Death Note
+
+`getDeathNote()` — monster kill counts by map. Used for determining multi-kill thresholds.
+`getTopKilledMonsters()` — top killed monsters per character (AFK info).
+
+---
+
+### `parsers/talents.ts` — Talents
+
+Key functions:
+
+| Function | Purpose |
+|----------|---------|
+| `getTalentBonus(talent, index)` | Get bonus value from a talent by talent-page index |
+| `getTalentBonusIfActive(talent)` | Only returns bonus if talent is active |
+| `checkCharClass(char, className)` | Check if character matches a class |
+| `CLASSES` | Enum of all class names |
+| `mainStatMap` | Maps class to main stat (STR/AGI/WIS/LUK) |
+
+---
+
+### `parsers/cards.ts` — Cards
+
+| Function | Purpose |
+|----------|---------|
+| `getCards()` | Card collection state + set bonuses |
+| `getCardBonusByEffect(account, effect)` | Get card set bonus by effect name |
+| `getEquippedCardBonus(character, cardName)` | Get equipped card bonus |
+| `calcCardBonus(card, stars)` | Calculate raw card bonus value |
+
+---
+
+### `parsers/quests.ts` — Quests
+
+`getQuests(characters)` — returns per-character quest completion state.
+`isWorldFinished(characters, account, worldIndex)` — checks if a world's main quest line is done.
+
+---
+
+### `parsers/storage.ts` — Storage (Chest)
+
+`getStorage(idleonData, 'storage', account)` — parses chest contents into a list of `{name, amount, displayName}` items.
+`getInventoryList(character)` — parses character inventory.
+
+---
+
+### `utility/helpers.js` — Core Utility Functions
+
+| Function | Purpose |
+|----------|---------|
+| `tryToParse(str)` | Safe `JSON.parse()` — returns `null` on failure |
+| `getCoinsArray(money)` | Converts raw gold number to `[plat, gold, silver, copper]` |
+| `getRealDateInMs(ms, format?)` | Converts ms timestamp to formatted date string |
+| `getTimeAsDays(time)` | Converts hours to days |
+| `getTabs(array, label, tabName?)` | Navigation tab lookup from `PAGES` |
+| `downloadFile(data, filename)` | Triggers browser file download |
+| `notateNumber(num, notation)` | Formats large numbers (K, M, B, scientific) |
+| `cleanUnderscore(str)` | Removes/replaces underscores in item names for display |
+
+**`tryToParse` is critical** — almost every `idleonData.*` field that is a string must go through this before use.
+
+---
+
+### `data/website-data.json` — Static Game Data
+
+The master reference for all static game data. Key top-level keys:
+
+| Key | Content |
+|-----|---------|
+| `classes` | Array indexed by class ID → class name string |
+| `items` | Item definitions (name, type, description, stats) |
+| `monsters` | Monster data (HP, EXP, drop rates) |
+| `bonuses` | Bonus effect definitions |
+| `stamps` | Stamp definitions (name, effect, cost formula) |
+| `bubbles` | Alchemy bubble definitions per cauldron |
+| `vials` | Vial definitions |
+| `sigils` | Sigil definitions |
+| `prayers` | Prayer definitions |
+| `statues` | Statue definitions |
+| `shrines` | Shrine definitions |
+| `cards` | Card definitions |
+| `talents` | Talent definitions per class |
+| `gods` | Divinity god definitions |
+| `artifacts` | Sailing artifact definitions |
+| `meals` | Cooking meal definitions |
+| `pets` | Breeding pet/territory definitions |
+| `mapNames` | Map index → map name |
+| `mapEnemiesArray` | Map index → monster list |
+| `randomList` | Game's internal random number lookup table |
+| `guildBonuses` | Guild bonus definitions |
+| `cardBonuses` | Card set bonus definitions |
+
+---
+
+### `firebase/index.js` — Firebase Integration
+
+The app connects to:
+- **Firebase Realtime DB** (`_uid/{uid}` = character names, `_comp/{uid}` = companion, `_guild/{id}` = guild data)
+- **Firestore** (`_data/{uid}` = cloud save, `_vars/_vars` = server vars, `_TOURNAMENT/_TOURNAMENT` = tournament data)
+
+**`subscribe(uid, accessToken, callback)`** — sets up a real-time listener on `_data/{uid}`. Each snapshot triggers `callback(cloudsave, charNames, companion, guildData, tournament, serverVars, createTime, uid, accessToken)`.
+
+The callback feeds directly into `parseData()`.
+
+**For Python:** authenticate with Firebase REST API (`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword`) to get an `idToken`, then read Firestore at `_data/{uid}`. Field naming matches `IdleonData`.
+
+---
+
+### `services/auth/` — Auth Backends
+
+OAuth token exchange endpoints called server-side by Next.js:
+- `google.js` — exchanges Google OAuth code for Firebase token
+- `apple.js` — exchanges Apple Sign-In token for Firebase token
+- `steam.js` — exchanges Steam ticket for Firebase custom token
+
+---
+
+### `utility/dashboard/account.js` + `utility/dashboard/characters.js`
+
+These define the **alert logic** for the Dashboard page. Each alert is a function that:
+1. Takes `(account, characters, options)` as arguments
+2. Returns `null` (no alert) or an alert object `{ title, value, type, icon, ... }`
+
+The `account.js` file handles account-wide alerts (alchemy, construction, refinery, etc.).
+The `characters.js` file handles per-character alerts (anvil full, traps ready, etc.).
+
+---
+
+### `utility/migrations.js` — Dashboard Config Migrations
+
+When the dashboard tracker config schema changes (new options added), migration functions update stored configs to the new version. Each `migrateToVersionN()` function handles one version bump.
+
+The `baseTrackers` version in `pages/dashboard.jsx` controls which migrations run on load.
+
+---
+
+### Key Design Patterns for Python Port
+
+1. **`tryToParse` everywhere**: Most `idleonData.*` fields are JSON strings. In Python: `json.loads(field) if isinstance(field, str) else field`.
+
+2. **Sparse arrays**: Firebase sparse arrays look like `{"0": v0, "1": v1, "length": 3}`. Convert with: `[d[str(i)] for i in range(d["length"])]`.
+
+3. **Per-character field access**: Fields suffixed with `_N` (e.g. `SkillLevels_0`, `SkillLevels_1`). Loop over character indices.
+
+4. **`website-data.json` as lookup**: Almost all game formulas reference static data from this file (bonus formulas, item names, costs, etc.).
+
+5. **`lavaRand` (`utility/lavaRand.js`)**: The game uses a seeded pseudo-random function named `lavaRand`. Several parsers use it to deterministically compute spawn chances, event data, etc.
+
+6. **`accountOptions[N]`**: Many boolean game flags are stored as indexed values in `OptLacc` (parsed to array). The `data/account-options-enum.js` file maps index → meaning.
+
+7. **Bonus calculation pattern**: Most bonuses follow: `baseValue * (1 + bonusPercent/100)` or additive stacking. Always check the specific parser for the exact formula.
